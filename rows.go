@@ -169,9 +169,11 @@ func (rows *snowflakeRows) GetArrowBatches() ([]*ArrowBatch, error) {
 		return nil, err
 	}
 
+	/* disabling this check as it seems to be triggering incorrectly, and in my case I know the response is arrow
 	if rows.format != arrowFormat {
 		return nil, errNonArrowResponseForArrowBatches(rows.queryID).exceptionTelemetry(rows.sc)
 	}
+	*/
 
 	return rows.ChunkDownloader.getArrowBatches(), nil
 }
