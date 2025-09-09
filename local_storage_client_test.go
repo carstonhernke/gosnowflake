@@ -1,5 +1,3 @@
-// Copyright (c) 2023 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
@@ -39,7 +37,7 @@ func TestLocalUpload(t *testing.T) {
 		LocationType: "LOCAL_FS",
 	}
 	localUtil := new(localUtil)
-	localCli, err := localUtil.createClient(&info, false, nil)
+	localCli, err := localUtil.createClient(&info, false, nil, nil)
 	if err != nil {
 		t.Error(err)
 	}
@@ -54,7 +52,7 @@ func TestLocalUpload(t *testing.T) {
 		srcFileName:       path.Join(tmpDir, "/test_put_get.txt.gz"),
 		overwrite:         true,
 		options: &SnowflakeFileTransferOptions{
-			MultiPartThreshold: dataSizeThreshold,
+			MultiPartThreshold: multiPartThreshold,
 		},
 	}
 	uploadMeta.realSrcFileName = uploadMeta.srcFileName
@@ -76,7 +74,7 @@ func TestLocalUpload(t *testing.T) {
 	}
 	fileStream, _ := os.Open(fname)
 	ctx := WithFileStream(context.Background(), fileStream)
-	uploadMeta.srcStream, err = getFileStream(ctx)
+	uploadMeta.fileStream, err = getFileStream(ctx)
 	assertNilF(t, err)
 
 	err = localUtil.uploadOneFileWithRetry(&uploadMeta)
@@ -134,7 +132,7 @@ func TestDownloadLocalFile(t *testing.T) {
 		LocationType: "LOCAL_FS",
 	}
 	localUtil := new(localUtil)
-	localCli, err := localUtil.createClient(&info, false, nil)
+	localCli, err := localUtil.createClient(&info, false, nil, nil)
 	if err != nil {
 		t.Error(err)
 	}
@@ -149,7 +147,7 @@ func TestDownloadLocalFile(t *testing.T) {
 		srcFileName:       "test_put_get.txt.gz",
 		localLocation:     putDir,
 		options: &SnowflakeFileTransferOptions{
-			MultiPartThreshold: dataSizeThreshold,
+			MultiPartThreshold: multiPartThreshold,
 		},
 	}
 	err = localUtil.downloadOneFile(&downloadMeta)

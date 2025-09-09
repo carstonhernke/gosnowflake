@@ -20,7 +20,7 @@ import (
 type ObjectType struct {
 }
 
-var structuredObjectWriterType = reflect.TypeOf((*StructuredObjectWriter)(nil)).Elem()
+var structuredObjectWriterType = reflect.TypeFor[StructuredObjectWriter]()
 
 // StructuredObject is a representation of structured object for reading.
 type StructuredObject interface {
@@ -870,7 +870,7 @@ func (st *structuredType) GetFloat32(fieldName string) (float32, error) {
 func (st *structuredType) GetFloat64(fieldName string) (float64, error) {
 	nullFloat64, err := st.GetNullFloat64(fieldName)
 	if err != nil {
-		return 0, nil
+		return 0, err
 	}
 	if !nullFloat64.Valid {
 		return 0, fmt.Errorf("nil value for %v, use GetNullFloat64 instead", fieldName)

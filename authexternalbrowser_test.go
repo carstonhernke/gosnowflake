@@ -1,10 +1,9 @@
-// Copyright (c) 2022 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
@@ -51,7 +50,7 @@ func TestGetTokenFromResponse(t *testing.T) {
 }
 
 func TestBuildResponse(t *testing.T) {
-	resp, err := buildResponse("Go")
+	resp, err := buildResponse(fmt.Sprintf(samlSuccessHTML, "Go"))
 	assertNilF(t, err)
 	bytes := resp.Bytes()
 	respStr := string(bytes[:])
@@ -61,6 +60,11 @@ func TestBuildResponse(t *testing.T) {
 }
 
 func postAuthExternalBrowserError(_ context.Context, _ *snowflakeRestful, _ map[string]string, _ []byte, _ time.Duration) (*authResponse, error) {
+	return &authResponse{}, errors.New("failed to get SAML response")
+}
+
+func postAuthExternalBrowserErrorDelayed(_ context.Context, _ *snowflakeRestful, _ map[string]string, _ []byte, _ time.Duration) (*authResponse, error) {
+	time.Sleep(2 * time.Second)
 	return &authResponse{}, errors.New("failed to get SAML response")
 }
 
@@ -122,12 +126,12 @@ func TestAuthenticationTimeout(t *testing.T) {
 	account := "testaccount"
 	user := "u"
 	password := "p"
-	timeout := 0 * time.Second
+	timeout := 1 * time.Second
 	sr := &snowflakeRestful{
 		Protocol:         "https",
 		Host:             "abc.com",
 		Port:             443,
-		FuncPostAuthSAML: postAuthExternalBrowserError,
+		FuncPostAuthSAML: postAuthExternalBrowserErrorDelayed,
 		TokenAccessor:    getSimpleTokenAccessor(),
 	}
 	_, _, err := authenticateByExternalBrowser(context.Background(), sr, authenticator, application, account, user, password, timeout, ConfigBoolTrue)
@@ -135,7 +139,7 @@ func TestAuthenticationTimeout(t *testing.T) {
 }
 
 func Test_createLocalTCPListener(t *testing.T) {
-	listener, err := createLocalTCPListener()
+	listener, err := createLocalTCPListener(0)
 	if err != nil {
 		t.Fatalf("createLocalTCPListener() failed: %v", err)
 	}

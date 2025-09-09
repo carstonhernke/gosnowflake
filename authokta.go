@@ -1,5 +1,3 @@
-// Copyright (c) 2017-2022 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
@@ -222,7 +220,11 @@ func postAuthSAML(
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			logger.WithContext(ctx).Errorf("failed to close response body for %v err: %v", fullURL, closeErr)
+		}
+	}()
 	if resp.StatusCode == http.StatusOK {
 		var respd authResponse
 		err = json.NewDecoder(resp.Body).Decode(&respd)
@@ -280,7 +282,11 @@ func postAuthOKTA(
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			logger.WithContext(ctx).Errorf("failed to close response body for %v err: %v", targetURL, closeErr)
+		}
+	}()
 	if resp.StatusCode == http.StatusOK {
 		var respd authOKTAResponse
 		err = json.NewDecoder(resp.Body).Decode(&respd)
@@ -323,7 +329,11 @@ func getSSO(
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			logger.WithContext(ctx).Errorf("failed to close response body for %v err: %v", fullURL, closeErr)
+		}
+	}()
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		logger.WithContext(ctx).Errorf("failed to extract HTTP response body. err: %v", err)

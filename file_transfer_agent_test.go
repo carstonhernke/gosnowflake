@@ -1,5 +1,3 @@
-// Copyright (c) 2022 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
@@ -7,16 +5,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"io"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/aws/smithy-go"
 )
@@ -53,15 +53,15 @@ func TestGetBucketAccelerateConfiguration(t *testing.T) {
 
 type s3ClientCreatorMock struct {
 	extract func(string) (*s3Location, error)
-	create  func(info *execResponseStageInfo, useAccelerateEndpoint bool, cfg *Config) (cloudClient, error)
+	create  func(info *execResponseStageInfo, useAccelerateEndpoint bool, cfg *Config, telemetry *snowflakeTelemetry) (cloudClient, error)
 }
 
 func (mock *s3ClientCreatorMock) extractBucketNameAndPath(location string) (*s3Location, error) {
 	return mock.extract(location)
 }
 
-func (mock *s3ClientCreatorMock) createClientWithConfig(info *execResponseStageInfo, useAccelerateEndpoint bool, cfg *Config) (cloudClient, error) {
-	return mock.create(info, useAccelerateEndpoint, cfg)
+func (mock *s3ClientCreatorMock) createClientWithConfig(info *execResponseStageInfo, useAccelerateEndpoint bool, cfg *Config, telemetry *snowflakeTelemetry) (cloudClient, error) {
+	return mock.create(info, useAccelerateEndpoint, cfg, telemetry)
 }
 
 type s3BucketAccelerateConfigGetterMock struct {
@@ -96,7 +96,7 @@ func TestGetBucketAccelerateConfigurationTooManyRetries(t *testing.T) {
 			extract: func(s string) (*s3Location, error) {
 				return &s3Location{bucketName: "test", s3Path: "test"}, nil
 			},
-			create: func(info *execResponseStageInfo, useAccelerateEndpoint bool, cfg *Config) (cloudClient, error) {
+			create: func(info *execResponseStageInfo, useAccelerateEndpoint bool, cfg *Config, _ *snowflakeTelemetry) (cloudClient, error) {
 				return &s3BucketAccelerateConfigGetterMock{err: errors.New("testing")}, nil
 			},
 		})
@@ -146,7 +146,7 @@ func TestGetBucketAccelerateConfigurationFailedCreateClient(t *testing.T) {
 			extract: func(s string) (*s3Location, error) {
 				return &s3Location{bucketName: "test", s3Path: "test"}, nil
 			},
-			create: func(info *execResponseStageInfo, useAccelerateEndpoint bool, cfg *Config) (cloudClient, error) {
+			create: func(info *execResponseStageInfo, useAccelerateEndpoint bool, cfg *Config, _ *snowflakeTelemetry) (cloudClient, error) {
 				return nil, errors.New("failed creation")
 			},
 		})
@@ -172,7 +172,7 @@ func TestGetBucketAccelerateConfigurationInvalidClient(t *testing.T) {
 			extract: func(s string) (*s3Location, error) {
 				return &s3Location{bucketName: "test", s3Path: "test"}, nil
 			},
-			create: func(info *execResponseStageInfo, useAccelerateEndpoint bool, cfg *Config) (cloudClient, error) {
+			create: func(info *execResponseStageInfo, useAccelerateEndpoint bool, cfg *Config, _ *snowflakeTelemetry) (cloudClient, error) {
 				return 1, nil
 			},
 		})
@@ -472,7 +472,7 @@ func TestUpdateMetadataWithPresignedUrl(t *testing.T) {
 			}, nil
 		}
 
-		gcsCli, err := new(snowflakeGcsClient).createClient(&info, false)
+		gcsCli, err := new(snowflakeGcsClient).createClient(&info, false, &snowflakeTelemetry{})
 		if err != nil {
 			t.Error(err)
 		}
@@ -487,7 +487,7 @@ func TestUpdateMetadataWithPresignedUrl(t *testing.T) {
 			srcFileName:       path.Join(dir, "/test_data/data1.txt"),
 			overwrite:         true,
 			options: &SnowflakeFileTransferOptions{
-				MultiPartThreshold: dataSizeThreshold,
+				MultiPartThreshold: multiPartThreshold,
 			},
 		}
 
@@ -525,7 +525,7 @@ func TestUpdateMetadataWithPresignedUrlForDownload(t *testing.T) {
 
 		testURL := "https://storage.google.com/gcs-blob/storage/users/456?Signature=testsignature123"
 
-		gcsCli, err := new(snowflakeGcsClient).createClient(&info, false)
+		gcsCli, err := new(snowflakeGcsClient).createClient(&info, false, &snowflakeTelemetry{})
 		if err != nil {
 			t.Error(err)
 		}
@@ -590,14 +590,10 @@ func TestUploadWhenFilesystemReadOnlyError(t *testing.T) {
 		t.Skip("permission model is different")
 	}
 
-	var err error
 	roPath := t.TempDir()
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	// Set the temp directory to read only
-	err = os.Chmod(roPath, 0444)
+	err := os.Chmod(roPath, 0444)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -625,7 +621,7 @@ func TestUploadWhenFilesystemReadOnlyError(t *testing.T) {
 		srcFileName:       path.Join(dir, "/test_data/data1.txt"),
 		overwrite:         true,
 		options: &SnowflakeFileTransferOptions{
-			MultiPartThreshold: dataSizeThreshold,
+			MultiPartThreshold: multiPartThreshold,
 		},
 	}
 
@@ -802,7 +798,7 @@ func TestCustomTmpDirPath(t *testing.T) {
 		srcFileName: uploadFile,
 		overwrite:   true,
 		options: &SnowflakeFileTransferOptions{
-			MultiPartThreshold: dataSizeThreshold,
+			MultiPartThreshold: multiPartThreshold,
 		},
 	}
 
@@ -821,7 +817,7 @@ func TestCustomTmpDirPath(t *testing.T) {
 		dstFileName: downloadFile,
 		overwrite:   true,
 		options: &SnowflakeFileTransferOptions{
-			MultiPartThreshold: dataSizeThreshold,
+			MultiPartThreshold: multiPartThreshold,
 		},
 	}
 
@@ -888,7 +884,7 @@ func TestReadonlyTmpDirPathShouldFail(t *testing.T) {
 		srcFileName: uploadFile,
 		overwrite:   true,
 		options: &SnowflakeFileTransferOptions{
-			MultiPartThreshold: dataSizeThreshold,
+			MultiPartThreshold: multiPartThreshold,
 		},
 	}
 
@@ -944,7 +940,7 @@ func testUploadDownloadOneFile(t *testing.T, isStream bool) {
 		srcFileName: uploadFile,
 		overwrite:   true,
 		options: &SnowflakeFileTransferOptions{
-			MultiPartThreshold: dataSizeThreshold,
+			MultiPartThreshold: multiPartThreshold,
 		},
 		requireCompress: true,
 	}
@@ -963,8 +959,9 @@ func testUploadDownloadOneFile(t *testing.T, isStream bool) {
 		srcFileName: "data.txt.gz",
 		dstFileName: downloadFile,
 		overwrite:   true,
+		parallel:    int64(10),
 		options: &SnowflakeFileTransferOptions{
-			MultiPartThreshold: dataSizeThreshold,
+			MultiPartThreshold: multiPartThreshold,
 		},
 	}
 
@@ -981,7 +978,7 @@ func testUploadDownloadOneFile(t *testing.T, isStream bool) {
 	if isStream {
 		fileStream, _ := os.Open(uploadFile)
 		ctx := WithFileStream(context.Background(), fileStream)
-		uploadMeta.srcStream, err = getFileStream(ctx)
+		uploadMeta.fileStream, err = getFileStream(ctx)
 		assertNilF(t, err)
 	}
 
@@ -1002,5 +999,297 @@ func testUploadDownloadOneFile(t *testing.T, isStream bool) {
 	}()
 	if downloadMeta.resStatus != downloaded {
 		t.Fatalf("failed to download file")
+	}
+}
+
+func TestPutGetRegexShouldIgnoreWhitespaceAtTheBeginning(t *testing.T) {
+	for _, test := range []struct {
+		regex string
+		query string
+	}{
+		{
+			regex: putRegexp,
+			query: "PUT abc",
+		},
+		{
+			regex: putRegexp,
+			query: "   PUT abc",
+		},
+		{
+			regex: putRegexp,
+			query: "\tPUT abc",
+		},
+		{
+			regex: putRegexp,
+			query: "\nPUT abc",
+		},
+		{
+			regex: putRegexp,
+			query: "\r\nPUT abc",
+		},
+		{
+			regex: getRegexp,
+			query: "GET abc",
+		},
+		{
+			regex: getRegexp,
+			query: "   GET abc",
+		},
+		{
+			regex: getRegexp,
+			query: "\tGET abc",
+		},
+		{
+			regex: getRegexp,
+			query: "\nGET abc",
+		},
+		{
+			regex: getRegexp,
+			query: "\r\nGET abc",
+		},
+	} {
+		{
+			t.Run(test.regex+" "+test.query, func(t *testing.T) {
+				regex := regexp.MustCompile(test.regex)
+				assertTrueE(t, regex.Match([]byte(test.query)))
+				assertFalseE(t, regex.Match([]byte("prefix "+test.query)))
+			})
+		}
+	}
+}
+
+func TestEncryptStream(t *testing.T) {
+	srcBytes := []byte{63, 64, 65}
+	initStr := bytes.NewBuffer(srcBytes)
+
+	for _, tc := range []struct {
+		ct            cloudType
+		encrypt       bool
+		realSrcStream bool
+		encryptMat    bool
+	}{
+		{
+			ct:            s3Client,
+			encrypt:       true,
+			realSrcStream: true,
+			encryptMat:    true,
+		},
+		{
+			ct:            s3Client,
+			encrypt:       true,
+			realSrcStream: false,
+			encryptMat:    true,
+		},
+		{
+			ct:            s3Client,
+			encrypt:       false,
+			realSrcStream: false,
+			encryptMat:    false,
+		},
+		{
+			ct:            azureClient,
+			encrypt:       true,
+			realSrcStream: true,
+			encryptMat:    true,
+		},
+		{
+			ct:            azureClient,
+			encrypt:       true,
+			realSrcStream: false,
+			encryptMat:    true,
+		},
+		{
+			ct:            azureClient,
+			encrypt:       false,
+			realSrcStream: false,
+			encryptMat:    false,
+		},
+		{
+			ct:            gcsClient,
+			encrypt:       true,
+			realSrcStream: true,
+			encryptMat:    true,
+		},
+		{
+			ct:            gcsClient,
+			encrypt:       true,
+			realSrcStream: false,
+			encryptMat:    true,
+		},
+		{
+			ct:            gcsClient,
+			encrypt:       false,
+			realSrcStream: false,
+			encryptMat:    false,
+		},
+		{
+			ct:            local,
+			encrypt:       false,
+			realSrcStream: true,
+			encryptMat:    true,
+		},
+		{
+			ct:            local,
+			encrypt:       false,
+			realSrcStream: true,
+			encryptMat:    false,
+		},
+		{
+			ct:            local,
+			encrypt:       false,
+			realSrcStream: false,
+			encryptMat:    true,
+		},
+		{
+			ct:            local,
+			encrypt:       false,
+			realSrcStream: false,
+			encryptMat:    false,
+		},
+	} {
+		{
+			var encMat *snowflakeFileEncryption = nil
+			if tc.encryptMat {
+				encMat = &snowflakeFileEncryption{
+					QueryStageMasterKey: "abCdEFO0upIT36dAxGsa0w==",
+					QueryID:             "01abc874-0406-1bf0-0000-53b10668e056",
+					SMKID:               92019681909886,
+				}
+			}
+			var realSrcStr *bytes.Buffer = nil
+			if tc.realSrcStream {
+				realSrcStr = initStr
+			}
+			uploadMeta := fileMetadata{
+				name:               "data1.txt.gz",
+				stageLocationType:  tc.ct,
+				noSleepingTime:     true,
+				parallel:           int64(100),
+				client:             nil,
+				sha256Digest:       "123456789abcdef",
+				stageInfo:          nil,
+				dstFileName:        "data1.txt.gz",
+				srcStream:          initStr,
+				realSrcStream:      realSrcStr,
+				overwrite:          true,
+				options:            nil,
+				encryptionMaterial: encMat,
+				mockUploader:       nil,
+				sfa:                nil,
+			}
+
+			t.Run(string(tc.ct)+" encrypt "+strconv.FormatBool(tc.encrypt)+" realSrcStream "+strconv.FormatBool(tc.realSrcStream)+" encryptMat "+strconv.FormatBool(tc.encryptMat), func(t *testing.T) {
+				err := encryptDataIfRequired(&uploadMeta, tc.ct)
+				assertNilF(t, err)
+				if tc.encrypt {
+					assertNotNilF(t, uploadMeta.encryptMeta, "encryption metadata should be present")
+					if tc.realSrcStream {
+						assertNotEqualF(t, uploadMeta.realSrcStream, realSrcStr, "stream should be encrypted")
+					} else {
+						assertNotEqualF(t, uploadMeta.realSrcStream, initStr, "stream should not be encrypted")
+					}
+				} else {
+					assertNilF(t, uploadMeta.encryptMeta, "encryption metadata should be empty")
+					assertEqualF(t, uploadMeta.realSrcStream, realSrcStr, "stream should not be encrypted")
+				}
+			})
+		}
+	}
+}
+
+func TestEncryptFile(t *testing.T) {
+	for _, tc := range []struct {
+		ct         cloudType
+		encrypt    bool
+		encryptMat bool
+	}{
+		{
+			ct:         s3Client,
+			encrypt:    true,
+			encryptMat: true,
+		},
+		{
+			ct:         s3Client,
+			encrypt:    false,
+			encryptMat: false,
+		},
+		{
+			ct:         azureClient,
+			encrypt:    true,
+			encryptMat: true,
+		},
+		{
+			ct:         azureClient,
+			encrypt:    false,
+			encryptMat: false,
+		},
+		{
+			ct:         gcsClient,
+			encrypt:    true,
+			encryptMat: true,
+		},
+		{
+			ct:         gcsClient,
+			encrypt:    false,
+			encryptMat: false,
+		},
+		{
+			ct:         local,
+			encrypt:    false,
+			encryptMat: true,
+		},
+		{
+			ct:         local,
+			encrypt:    false,
+			encryptMat: false,
+		},
+	} {
+		dir, err := os.Getwd()
+		srcF := path.Join(dir, "/test_data/put_get_1.txt")
+		assertNilF(t, err, "error getting current directory")
+
+		var encMat *snowflakeFileEncryption = nil
+		if tc.encryptMat {
+			encMat = &snowflakeFileEncryption{
+				QueryStageMasterKey: "abCdEFO0upIT36dAxGsa0w==",
+				QueryID:             "01abc874-0406-1bf0-0000-53b10668e056",
+				SMKID:               92019681909886,
+			}
+		}
+
+		uploadMeta := fileMetadata{
+			name:               "data1.txt.gz",
+			stageLocationType:  tc.ct,
+			noSleepingTime:     true,
+			parallel:           int64(100),
+			client:             nil,
+			sha256Digest:       "123456789abcdef",
+			stageInfo:          nil,
+			dstFileName:        "data1.txt.gz",
+			srcFileName:        srcF,
+			realSrcFileName:    srcF,
+			overwrite:          true,
+			options:            nil,
+			encryptionMaterial: encMat,
+			mockUploader:       nil,
+			sfa:                nil,
+		}
+
+		t.Run(string(tc.ct)+" encrypt "+strconv.FormatBool(tc.encrypt)+" encryptMat "+strconv.FormatBool(tc.encryptMat), func(t *testing.T) {
+			err := encryptDataIfRequired(&uploadMeta, tc.ct)
+			assertNilF(t, err)
+			if tc.encrypt {
+				assertNotNilF(t, uploadMeta.encryptMeta, "encryption metadata should be present")
+				assertNotEqualF(t, uploadMeta.realSrcFileName, srcF, "file should be encrypted")
+				srcBytes, err := os.ReadFile(srcF)
+				assertNilF(t, err)
+				encBytes, err := os.ReadFile(uploadMeta.realSrcFileName)
+				assertNilF(t, err)
+				assertFalseF(t, bytes.Equal(srcBytes, encBytes), "file contents should differ")
+			} else {
+				assertNilF(t, uploadMeta.encryptMeta, "encryption metadata should be empty")
+				assertEqualF(t, uploadMeta.realSrcFileName, srcF, "file should not be encrypted")
+			}
+		})
 	}
 }

@@ -1,5 +1,3 @@
-// Copyright (c) 2017-2022 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
@@ -34,6 +32,9 @@ type SnowflakeRows interface {
 	GetQueryID() string
 	GetStatus() queryStatus
 	GetArrowBatches() ([]*ArrowBatch, error)
+	// NextResultSet switches Arrow Batches to the next result set.
+	// Returns io.EOF if there are no more result sets.
+	NextResultSet() error
 }
 
 type snowflakeRows struct {
@@ -46,7 +47,6 @@ type snowflakeRows struct {
 	errChannel          chan error
 	location            *time.Location
 	ctx                 context.Context
-	format              resultFormat
 }
 
 func (rows *snowflakeRows) getLocation() *time.Location {
@@ -150,7 +150,7 @@ func (rows *snowflakeRows) ColumnTypeScanType(index int) reflect.Type {
 	if err := rows.waitForAsyncQueryStatus(); err != nil {
 		return nil
 	}
-	return snowflakeTypeToGo(rows.ctx, getSnowflakeType(rows.ChunkDownloader.getRowType()[index].Type), rows.ChunkDownloader.getRowType()[index].Scale, rows.ChunkDownloader.getRowType()[index].Fields)
+	return snowflakeTypeToGo(rows.ctx, getSnowflakeType(rows.ChunkDownloader.getRowType()[index].Type), rows.ChunkDownloader.getRowType()[index].Precision, rows.ChunkDownloader.getRowType()[index].Scale, rows.ChunkDownloader.getRowType()[index].Fields)
 }
 
 func (rows *snowflakeRows) GetQueryID() string {
@@ -212,28 +212,30 @@ func (rows *snowflakeRows) HasNextResultSet() bool {
 	if err := rows.waitForAsyncQueryStatus(); err != nil {
 		return false
 	}
-	return rows.ChunkDownloader.hasNextResultSet()
+	hasNextResultSet := rows.ChunkDownloader.getNextChunkDownloader() != nil
+	logger.WithContext(rows.ctx).Debugf("[queryId: %v] Rows.HasNextResultSet: %v", rows.queryID, hasNextResultSet)
+	return hasNextResultSet
 }
 
 func (rows *snowflakeRows) NextResultSet() error {
+	logger.WithContext(rows.ctx).Debugf("[queryId: %v] Rows.NextResultSet", rows.queryID)
 	if err := rows.waitForAsyncQueryStatus(); err != nil {
 		return err
 	}
-	if len(rows.ChunkDownloader.getChunkMetas()) == 0 {
-		if rows.ChunkDownloader.getNextChunkDownloader() == nil {
-			return io.EOF
-		}
-		rows.ChunkDownloader = rows.ChunkDownloader.getNextChunkDownloader()
-		if err := rows.ChunkDownloader.start(); err != nil {
-			return err
-		}
+	if rows.ChunkDownloader.getNextChunkDownloader() == nil {
+		return io.EOF
 	}
-	return rows.ChunkDownloader.nextResultSet()
+	rows.ChunkDownloader = rows.ChunkDownloader.getNextChunkDownloader()
+	if err := rows.ChunkDownloader.start(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (rows *snowflakeRows) waitForAsyncQueryStatus() error {
 	// if async query, block until query is finished
-	if rows.status == QueryStatusInProgress {
+	switch rows.status {
+	case QueryStatusInProgress:
 		err := <-rows.errChannel
 		rows.status = QueryStatusComplete
 		if err != nil {
@@ -241,8 +243,10 @@ func (rows *snowflakeRows) waitForAsyncQueryStatus() error {
 			rows.err = err
 			return rows.err
 		}
-	} else if rows.status == QueryFailed {
+	case QueryFailed:
 		return rows.err
+	default:
+		return nil
 	}
 	return nil
 }

@@ -1,8 +1,7 @@
-// Copyright (c) 2017-2022 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -13,7 +12,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -192,45 +193,6 @@ func postAuthCheckPasscodeInPassword(_ context.Context, _ *snowflakeRestful, _ *
 	if ar.Data.Passcode != "" || ar.Data.ExtAuthnDuoMethod != "passcode" {
 		return nil, fmt.Errorf("passcode must be empty, got: %v, duo: %v", ar.Data.Passcode, ar.Data.ExtAuthnDuoMethod)
 	}
-	return &authResponse{
-		Success: true,
-		Data: authResponseMain{
-			Token:       "t",
-			MasterToken: "m",
-			SessionInfo: authResponseSessionInfo{
-				DatabaseName: "dbn",
-			},
-		},
-	}, nil
-}
-
-// JWT token validate callback function to check the JWT token
-// It uses the public key paired with the testPrivKey
-func postAuthCheckJWTToken(_ context.Context, _ *snowflakeRestful, _ *http.Client, _ *url.Values, _ map[string]string, bodyCreator bodyCreatorType, _ time.Duration) (*authResponse, error) {
-	var ar authRequest
-	jsonBody, _ := bodyCreator()
-	if err := json.Unmarshal(jsonBody, &ar); err != nil {
-		return nil, err
-	}
-	if ar.Data.Authenticator != AuthTypeJwt.String() {
-		return nil, errors.New("Authenticator is not JWT")
-	}
-
-	tokenString := ar.Data.Token
-
-	// Validate token
-	_, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		// Don't forget to validate the alg is what you expect:
-		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
-			return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
-		}
-
-		return testPrivKey.Public(), nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
 	return &authResponse{
 		Success: true,
 		Data: authResponseMain{
@@ -636,14 +598,56 @@ func TestUnitAuthenticatePasscode(t *testing.T) {
 func TestUnitAuthenticateJWT(t *testing.T) {
 	var err error
 
+	// Generate a fresh private key for this unit test only
+	localTestKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Failed to generate test private key: %s", err.Error())
+	}
+
+	// Create custom JWT verification function that uses the local key
+	postAuthCheckLocalJWTToken := func(_ context.Context, _ *snowflakeRestful, _ *http.Client, _ *url.Values, _ map[string]string, bodyCreator bodyCreatorType, _ time.Duration) (*authResponse, error) {
+		var ar authRequest
+		jsonBody, _ := bodyCreator()
+		if err := json.Unmarshal(jsonBody, &ar); err != nil {
+			return nil, err
+		}
+		if ar.Data.Authenticator != AuthTypeJwt.String() {
+			return nil, errors.New("Authenticator is not JWT")
+		}
+
+		tokenString := ar.Data.Token
+
+		// Validate token using the local test key's public key
+		_, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+				return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+			}
+			return localTestKey.Public(), nil // Use local key for verification
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		return &authResponse{
+			Success: true,
+			Data: authResponseMain{
+				Token:       "t",
+				MasterToken: "m",
+				SessionInfo: authResponseSessionInfo{
+					DatabaseName: "dbn",
+				},
+			},
+		}, nil
+	}
+
 	sr := &snowflakeRestful{
-		FuncPostAuth:  postAuthCheckJWTToken,
+		FuncPostAuth:  postAuthCheckLocalJWTToken, // Use local verification function
 		TokenAccessor: getSimpleTokenAccessor(),
 	}
 	sc := getDefaultSnowflakeConn()
 	sc.cfg.Authenticator = AuthTypeJwt
 	sc.cfg.JWTExpireTimeout = defaultJWTTimeout
-	sc.cfg.PrivateKey = testPrivKey
+	sc.cfg.PrivateKey = localTestKey
 	sc.rest = sr
 
 	// A valid JWT token should pass
@@ -1002,4 +1006,164 @@ func TestContextPropagatedToAuthWhenUsingOpenDB(t *testing.T) {
 	assertNotNilF(t, err)
 	assertStringContainsE(t, err.Error(), "context deadline exceeded")
 	cancel()
+}
+
+func TestPatSuccessfulFlow(t *testing.T) {
+	cfg := wiremock.connectionConfig()
+	cfg.Authenticator = AuthTypePat
+	cfg.Token = "some PAT"
+	wiremock.registerMappings(t,
+		wiremockMapping{filePath: "auth/pat/successful_flow.json"},
+		wiremockMapping{filePath: "select1.json"},
+	)
+	connector := NewConnector(SnowflakeDriver{}, *cfg)
+	db := sql.OpenDB(connector)
+	rows, err := db.Query("SELECT 1")
+	assertNilF(t, err)
+	var v int
+	assertTrueE(t, rows.Next())
+	assertNilF(t, rows.Scan(&v))
+	assertEqualE(t, v, 1)
+}
+
+func TestPatInvalidToken(t *testing.T) {
+	wiremock.registerMappings(t,
+		wiremockMapping{filePath: "auth/pat/invalid_token.json"},
+	)
+	cfg := wiremock.connectionConfig()
+	cfg.Authenticator = AuthTypePat
+	cfg.Token = "some PAT"
+	connector := NewConnector(SnowflakeDriver{}, *cfg)
+	db := sql.OpenDB(connector)
+	_, err := db.Query("SELECT 1")
+	assertNotNilF(t, err)
+	var se *SnowflakeError
+	assertErrorsAsF(t, err, &se)
+	assertEqualE(t, se.Number, 394400)
+	assertEqualE(t, se.Message, "Programmatic access token is invalid.")
+}
+
+func TestWithOauthAuthorizationCodeFlowManual(t *testing.T) {
+	t.Skip("manual test")
+	for _, provider := range []string{"OKTA", "SNOWFLAKE"} {
+		t.Run(provider, func(t *testing.T) {
+			cfg, err := GetConfigFromEnv([]*ConfigParam{
+				{"OAuthClientId", "SNOWFLAKE_TEST_OAUTH_" + provider + "_CLIENT_ID", true},
+				{"OAuthClientSecret", "SNOWFLAKE_TEST_OAUTH_" + provider + "_CLIENT_SECRET", true},
+				{"OAuthAuthorizationURL", "SNOWFLAKE_TEST_OAUTH_" + provider + "_AUTHORIZATION_URL", false},
+				{"OAuthTokenRequestURL", "SNOWFLAKE_TEST_OAUTH_" + provider + "_TOKEN_REQUEST_URL", false},
+				{"OAuthRedirectURI", "SNOWFLAKE_TEST_OAUTH_" + provider + "_REDIRECT_URI", false},
+				{"OAuthScope", "SNOWFLAKE_TEST_OAUTH_" + provider + "_SCOPE", false},
+				{"User", "SNOWFLAKE_TEST_OAUTH_" + provider + "_USER", true},
+				{"Role", "SNOWFLAKE_TEST_OAUTH_" + provider + "_ROLE", true},
+				{"Account", "SNOWFLAKE_TEST_ACCOUNT", true},
+			})
+			assertNilF(t, err)
+			cfg.Authenticator = AuthTypeOAuthAuthorizationCode
+			tokenRequestURL := cmp.Or(cfg.OauthTokenRequestURL, fmt.Sprintf("https://%v.snowflakecomputing.com:443/oauth/token-request", cfg.Account))
+			credentialsStorage.deleteCredential(newOAuthAccessTokenSpec(tokenRequestURL, cfg.User))
+			credentialsStorage.deleteCredential(newOAuthRefreshTokenSpec(tokenRequestURL, cfg.User))
+			connector := NewConnector(&SnowflakeDriver{}, *cfg)
+			db := sql.OpenDB(connector)
+			defer db.Close()
+			conn1, err := db.Conn(context.Background())
+			assertNilF(t, err)
+			defer conn1.Close()
+			runSmokeQueryWithConn(t, conn1)
+			conn2, err := db.Conn(context.Background())
+			assertNilF(t, err)
+			defer conn2.Close()
+			runSmokeQueryWithConn(t, conn2)
+			credentialsStorage.setCredential(newOAuthAccessTokenSpec(cfg.OauthTokenRequestURL, cfg.User), "expired-token")
+			conn3, err := db.Conn(context.Background())
+			assertNilF(t, err)
+			defer conn3.Close()
+			runSmokeQueryWithConn(t, conn3)
+		})
+	}
+}
+
+func TestWithOAuthClientCredentialsFlowManual(t *testing.T) {
+	t.Skip("manual test")
+	cfg, err := GetConfigFromEnv([]*ConfigParam{
+		{"OAuthClientId", "SNOWFLAKE_TEST_OAUTH_OKTA_CLIENT_ID", true},
+		{"OAuthClientSecret", "SNOWFLAKE_TEST_OAUTH_OKTA_CLIENT_SECRET", true},
+		{"OAuthTokenRequestURL", "SNOWFLAKE_TEST_OAUTH_OKTA_TOKEN_REQUEST_URL", true},
+		{"Role", "SNOWFLAKE_TEST_OAUTH_OKTA_ROLE", true},
+		{"Account", "SNOWFLAKE_TEST_ACCOUNT", true},
+	})
+	assertNilF(t, err)
+	cfg.Authenticator = AuthTypeOAuthClientCredentials
+	connector := NewConnector(&SnowflakeDriver{}, *cfg)
+	db := sql.OpenDB(connector)
+	defer db.Close()
+	runSmokeQuery(t, db)
+}
+
+// Running this test locally:
+// * Push branch to repository
+// * Set PARAMETERS_SECRET
+// * Run ci/test_wif.sh
+func TestWorkloadIdentityAuthOnCloudVM(t *testing.T) {
+	account := os.Getenv("SNOWFLAKE_TEST_WIF_ACCOUNT")
+	host := os.Getenv("SNOWFLAKE_TEST_WIF_HOST")
+	provider := os.Getenv("SNOWFLAKE_TEST_WIF_PROVIDER")
+	if account == "" || host == "" || provider == "" {
+		t.Skip("Test can run only on cloud VM with env variables set")
+	}
+	testCases := []struct {
+		name     string
+		skip     func() (bool, string)
+		setupCfg func(*Config)
+	}{
+		{
+			name: "provider=" + provider,
+			setupCfg: func(config *Config) {
+				config.WorkloadIdentityProvider = provider
+			},
+		},
+		{
+			name: "provider=OIDC",
+			skip: func() (bool, string) {
+				if provider != "GCP" {
+					return true, "OIDC test works only on GCP"
+				}
+				return false, ""
+			},
+			setupCfg: func(config *Config) {
+				config.WorkloadIdentityProvider = "OIDC"
+				config.Token = func() string {
+					cmd := exec.Command("wget", "-O", "-", "--header=Metadata-Flavor: Google", "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/identity?audience=snowflakecomputing.com")
+					output, err := cmd.Output()
+					if err != nil {
+						t.Fatalf("error executing GCP metadata request: %v", err)
+					}
+					token := strings.TrimSpace(string(output))
+					if token == "" {
+						t.Fatal("failed to retrieve GCP access token: empty response")
+					}
+					return token
+				}()
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.skip != nil {
+				if skip, msg := tc.skip(); skip {
+					t.Skip(msg)
+				}
+			}
+			config := &Config{
+				Account:       account,
+				Host:          host,
+				Authenticator: AuthTypeWorkloadIdentityFederation,
+			}
+			tc.setupCfg(config)
+			connector := NewConnector(SnowflakeDriver{}, *config)
+			db := sql.OpenDB(connector)
+			defer db.Close()
+			runSmokeQuery(t, db)
+		})
+	}
 }

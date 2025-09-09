@@ -1,9 +1,8 @@
-// Copyright (c) 2021-2022 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -32,7 +31,8 @@ const (
 )
 
 type snowflakeS3Client struct {
-	cfg *Config
+	cfg       *Config
+	telemetry *snowflakeTelemetry
 }
 
 type s3Location struct {
@@ -45,11 +45,15 @@ type s3Location struct {
 // See https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/aws#ClientLogMode for allowed values.
 var S3LoggingMode aws.ClientLogMode
 
-func (util *snowflakeS3Client) createClient(info *execResponseStageInfo, useAccelerateEndpoint bool) (cloudClient, error) {
+func (util *snowflakeS3Client) createClient(info *execResponseStageInfo, useAccelerateEndpoint bool, telemetry *snowflakeTelemetry) (cloudClient, error) {
 	stageCredentials := info.Creds
 	s3Logger := logging.LoggerFunc(s3LoggingFunc)
 	endPoint := getS3CustomEndpoint(info)
 
+	transport, err := newTransportFactory(util.cfg, telemetry).createTransport()
+	if err != nil {
+		return nil, err
+	}
 	return s3.New(s3.Options{
 		Region: info.Region,
 		Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(
@@ -59,7 +63,7 @@ func (util *snowflakeS3Client) createClient(info *execResponseStageInfo, useAcce
 		BaseEndpoint:  endPoint,
 		UseAccelerate: useAccelerateEndpoint,
 		HTTPClient: &http.Client{
-			Transport: getTransport(util.cfg),
+			Transport: transport,
 		},
 		ClientLogMode: S3LoggingMode,
 		Logger:        s3Logger,
@@ -67,10 +71,11 @@ func (util *snowflakeS3Client) createClient(info *execResponseStageInfo, useAcce
 }
 
 // to be used with S3 transferAccelerateConfigWithUtil
-func (util *snowflakeS3Client) createClientWithConfig(info *execResponseStageInfo, useAccelerateEndpoint bool, cfg *Config) (cloudClient, error) {
+func (util *snowflakeS3Client) createClientWithConfig(info *execResponseStageInfo, useAccelerateEndpoint bool, cfg *Config, telemetry *snowflakeTelemetry) (cloudClient, error) {
 	// copy snowflakeFileTransferAgent's config onto the cloud client so we could decide which Transport to use
 	util.cfg = cfg
-	return util.createClient(info, useAccelerateEndpoint)
+	util.telemetry = telemetry
+	return util.createClient(info, useAccelerateEndpoint, telemetry)
 }
 
 func getS3CustomEndpoint(info *execResponseStageInfo) *string {
@@ -178,17 +183,16 @@ type s3UploadAPI interface {
 func (util *snowflakeS3Client) uploadFile(
 	dataFile string,
 	meta *fileMetadata,
-	encryptMeta *encryptMetadata,
 	maxConcurrency int,
 	multiPartThreshold int64) error {
 	s3Meta := map[string]string{
 		httpHeaderContentType: httpHeaderValueOctetStream,
 		sfcDigest:             meta.sha256Digest,
 	}
-	if encryptMeta != nil {
-		s3Meta[amzIv] = encryptMeta.iv
-		s3Meta[amzKey] = encryptMeta.key
-		s3Meta[amzMatdesc] = encryptMeta.matdesc
+	if meta.encryptMeta != nil {
+		s3Meta[amzIv] = meta.encryptMeta.iv
+		s3Meta[amzKey] = meta.encryptMeta.key
+		s3Meta[amzMatdesc] = meta.encryptMeta.matdesc
 	}
 
 	s3loc, err := util.extractBucketNameAndPath(meta.stageInfo.Location)
@@ -215,10 +219,7 @@ func (util *snowflakeS3Client) uploadFile(
 
 	_, err = withCloudStorageTimeout(util.cfg, func(ctx context.Context) (any, error) {
 		if meta.srcStream != nil {
-			uploadStream := meta.srcStream
-			if meta.realSrcStream != nil {
-				uploadStream = meta.realSrcStream
-			}
+			uploadStream := cmp.Or(meta.realSrcStream, meta.srcStream)
 			return uploader.Upload(ctx, &s3.PutObjectInput{
 				Bucket:   &s3loc.bucketName,
 				Key:      &s3path,
@@ -269,7 +270,8 @@ type s3DownloadAPI interface {
 func (util *snowflakeS3Client) nativeDownloadFile(
 	meta *fileMetadata,
 	fullDstFileName string,
-	maxConcurrency int64) error {
+	maxConcurrency int64,
+	partSize int64) error {
 	s3Obj, _ := util.getS3Object(meta, meta.srcFileName)
 	client, ok := meta.client.(*s3.Client)
 	if !ok {
@@ -282,10 +284,15 @@ func (util *snowflakeS3Client) nativeDownloadFile(
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if err = f.Close(); err != nil {
+			logger.Warnf("failed to close %v file: %v", fullDstFileName, err)
+		}
+	}()
 	var downloader s3DownloadAPI
 	downloader = manager.NewDownloader(client, func(u *manager.Downloader) {
 		u.Concurrency = int(maxConcurrency)
+		u.PartSize = int64Max(partSize, manager.DefaultDownloadPartSize)
 	})
 	// for testing only
 	if meta.mockDownloader != nil {

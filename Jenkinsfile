@@ -2,7 +2,7 @@ import groovy.json.JsonOutput
 
 
 timestamps {
-  node('regular-memory-node') {
+  node('high-memory-node') {
     stage('checkout') {
       scmInfo = checkout scm
       println("${scmInfo}")
@@ -10,11 +10,11 @@ timestamps {
       env.GIT_COMMIT = scmInfo.GIT_COMMIT
     }
     params = [
-      string(name: 'svn_revision', value: 'bptp-built'),
+      string(name: 'svn_revision', value: 'bptp-stable'),
       string(name: 'branch', value: 'main'),
       string(name: 'client_git_commit', value: scmInfo.GIT_COMMIT),
       string(name: 'client_git_branch', value: scmInfo.GIT_BRANCH),
-      string(name: 'TARGET_DOCKER_TEST_IMAGE', value: 'go-centos7-go1.21'),
+      string(name: 'TARGET_DOCKER_TEST_IMAGE', value: 'go-chainguard-go1_24'),
       string(name: 'parent_job', value: env.JOB_NAME),
       string(name: 'parent_build_number', value: env.BUILD_NUMBER)
     ]
@@ -36,6 +36,18 @@ timestamps {
             '''.stripMargin()
           }
         }
+      },
+      'Test WIF Auth': {
+        stage('Test WIF Auth') {
+          withCredentials([
+            string(credentialsId: 'sfctest0-parameters-secret', variable: 'PARAMETERS_SECRET'),
+          ]) {
+            sh '''\
+            |#!/bin/bash -e
+            |$WORKSPACE/ci/test_wif.sh
+            '''.stripMargin()
+          }
+        }
       }
     )
   }
@@ -43,7 +55,7 @@ timestamps {
 
 
 pipeline {
-  agent { label 'regular-memory-node' }
+  agent { label 'high-memory-node' }
   options { timestamps() }
   environment {
     COMMIT_SHA_LONG = sh(returnStdout: true, script: "echo \$(git rev-parse " + "HEAD)").trim()

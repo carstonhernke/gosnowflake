@@ -1,5 +1,3 @@
-// Copyright (c) 2017-2023 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
@@ -27,6 +25,12 @@ type tcUUID struct {
 
 type constTypeProvider struct {
 	constTime int64
+}
+
+type tcSafeGetTokens struct {
+	name              string
+	sr                *snowflakeRestful
+	expectedSessionID int64
 }
 
 func (ctp *constTypeProvider) currentTime() int64 {
@@ -89,6 +93,35 @@ func TestSimpleTokenAccessorGetTokensSynchronization(t *testing.T) {
 	wg.Wait()
 	if failed {
 		t.Fail()
+	}
+}
+
+func TestSafeGetTokens(t *testing.T) {
+	testcases := []tcSafeGetTokens{
+		{
+			name: "with simple token accessor",
+			sr: &snowflakeRestful{
+				FuncPostQuery: postQueryTest,
+				TokenAccessor: getSimpleTokenAccessor(),
+			},
+			expectedSessionID: -1,
+		},
+		{
+			name: "without token accessor",
+			sr: &snowflakeRestful{
+				FuncPostQuery: postQueryTest,
+			},
+			expectedSessionID: 0,
+		},
+	}
+
+	for _, test := range testcases {
+		t.Run(fmt.Sprintf("%v", test.name), func(t *testing.T) {
+			_, _, sessionID := safeGetTokens(test.sr)
+			assertEqualE(t, sessionID, test.expectedSessionID, "expected sessionId to be %v, was %v",
+				fmt.Sprintf("%d", test.expectedSessionID),
+				fmt.Sprintf("%d", sessionID))
+		})
 	}
 }
 
@@ -392,15 +425,21 @@ func skipOnJenkins(t *testing.T, message string) {
 	}
 }
 
-func runOnlyOnDockerContainer(t *testing.T, message string) {
-	if os.Getenv("AUTHENTICATION_TESTS_ENV") == "" {
-		t.Skip("Running only on Docker container: " + message)
+func skipAuthTests(t *testing.T, message string) {
+	if os.Getenv("RUN_AUTH_TESTS") != "true" {
+		t.Skip("Setup 'RUN_AUTH_TESTS' flag to perform this test" + message)
 	}
 }
 
 func skipOnMac(t *testing.T, reason string) {
 	if runtime.GOOS == "darwin" && runningOnGithubAction() {
 		t.Skip("skipped on Mac: " + reason)
+	}
+}
+
+func skipOnWindows(t *testing.T, reason string) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipped on Windows: " + reason)
 	}
 }
 
@@ -432,4 +471,30 @@ func TestFindByPrefix(t *testing.T) {
 	assertEqualE(t, findByPrefix(nonEmpty, "ccc"), 2)
 	assertEqualE(t, findByPrefix(nonEmpty, "dd"), -1)
 	assertEqualE(t, findByPrefix([]string{}, "dd"), -1)
+}
+
+func TestInternal(t *testing.T) {
+	ctx := context.Background()
+	assertFalseE(t, isInternal(ctx))
+	ctx = WithInternal(ctx)
+	assertTrueE(t, isInternal(ctx))
+}
+
+type envOverride struct {
+	envName  string
+	oldValue string
+}
+
+func (e *envOverride) rollback() {
+	if e.oldValue != "" {
+		os.Setenv(e.envName, e.oldValue)
+	} else {
+		os.Unsetenv(e.envName)
+	}
+}
+
+func overrideEnv(env string, value string) envOverride {
+	oldValue := os.Getenv(env)
+	os.Setenv(env, value)
+	return envOverride{env, oldValue}
 }

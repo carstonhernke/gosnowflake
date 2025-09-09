@@ -1,5 +1,3 @@
-// Copyright (c) 2021-2022 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
@@ -8,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -117,7 +114,11 @@ func (sc *snowflakeConn) processFileTransfer(
 		sfa.options = op
 	}
 	if sfa.options.MultiPartThreshold == 0 {
-		sfa.options.MultiPartThreshold = dataSizeThreshold
+		sfa.options.MultiPartThreshold = multiPartThreshold
+		// for streaming download, use a smaller default part size
+		if sfa.commandType == downloadCommand && sfa.options.GetFileToStream {
+			sfa.options.MultiPartThreshold = streamingMultiPartThreshold
+		}
 	}
 	if err := sfa.execute(); err != nil {
 		return nil, err
@@ -134,7 +135,7 @@ func (sc *snowflakeConn) processFileTransfer(
 	return data, nil
 }
 
-func getFileStream(ctx context.Context) (*bytes.Buffer, error) {
+func getFileStream(ctx context.Context) (io.Reader, error) {
 	s := ctx.Value(fileStreamFile)
 	if s == nil {
 		return nil, nil
@@ -143,9 +144,7 @@ func getFileStream(ctx context.Context) (*bytes.Buffer, error) {
 	if !ok {
 		return nil, errors.New("incorrect io.Reader")
 	}
-	buf := new(bytes.Buffer)
-	_, err := buf.ReadFrom(r)
-	return buf, err
+	return r, nil
 }
 
 func getFileTransferOptions(ctx context.Context) *SnowflakeFileTransferOptions {
@@ -214,6 +213,15 @@ func isAsyncMode(ctx context.Context) bool {
 
 func isDescribeOnly(ctx context.Context) bool {
 	v := ctx.Value(describeOnly)
+	if v == nil {
+		return false
+	}
+	d, ok := v.(bool)
+	return ok && d
+}
+
+func isInternal(ctx context.Context) bool {
+	v := ctx.Value(internalQuery)
 	if v == nil {
 		return false
 	}
@@ -290,11 +298,13 @@ func populateChunkDownloader(
 	if useStreamDownloader(ctx) && resultFormat(data.QueryResultFormat) == jsonFormat {
 		// stream chunk downloading only works for row based data formats, i.e. json
 		fetcher := &httpStreamChunkFetcher{
-			ctx:      ctx,
-			client:   sc.rest.Client,
-			clientIP: sc.cfg.ClientIP,
-			headers:  data.ChunkHeaders,
-			qrmk:     data.Qrmk,
+			ctx:           ctx,
+			client:        sc.rest.Client,
+			clientIP:      sc.cfg.ClientIP,
+			headers:       data.ChunkHeaders,
+			maxRetryCount: sc.rest.MaxRetryCount,
+			qrmk:          data.Qrmk,
+			timeout:       sc.rest.RequestTimeout,
 		}
 		return newStreamChunkDownloader(ctx, fetcher, data.Total, data.RowType,
 			data.RowSet, data.Chunks)
@@ -323,52 +333,12 @@ func populateChunkDownloader(
 	}
 }
 
-func setupOCSPEnvVars(ctx context.Context, host string) error {
-	host = strings.ToLower(host)
-
-	// only set OCSP envs if not already set
-	if val, set := os.LookupEnv(cacheServerURLEnv); set {
-		logger.WithContext(ctx).Debugf("OCSP Cache Server already set by user for %v: %v\n", host, val)
-		return nil
-	}
-	if isPrivateLink(host) {
-		if err := setupOCSPPrivatelink(ctx, host); err != nil {
-			return err
-		}
-	} else if !strings.HasSuffix(host, defaultDomain) {
-		ocspCacheServer := fmt.Sprintf("http://ocsp.%v/%v", host, cacheFileBaseName)
-		logger.WithContext(ctx).Debugf("OCSP Cache Server for %v: %v\n", host, ocspCacheServer)
-		if err := os.Setenv(cacheServerURLEnv, ocspCacheServer); err != nil {
-			return err
-		}
-	} else {
-		if _, set := os.LookupEnv(cacheServerURLEnv); set {
-			os.Unsetenv(cacheServerURLEnv)
-		}
-	}
-	return nil
-}
-
-func setupOCSPPrivatelink(ctx context.Context, host string) error {
-	ocspCacheServer := fmt.Sprintf("http://ocsp.%v/%v", host, cacheFileBaseName)
-	logger.WithContext(ctx).Debugf("OCSP Cache Server for Privatelink: %v\n", ocspCacheServer)
-	if err := os.Setenv(cacheServerURLEnv, ocspCacheServer); err != nil {
-		return err
-	}
-	ocspRetryHostTemplate := fmt.Sprintf("http://ocsp.%v/retry/", host) + "%v/%v"
-	logger.WithContext(ctx).Debugf("OCSP Retry URL for Privatelink: %v\n", ocspRetryHostTemplate)
-	if err := os.Setenv(ocspRetryURLEnv, ocspRetryHostTemplate); err != nil {
-		return err
-	}
-	return nil
-}
-
 /**
  * We can only tell if private link is enabled for certain hosts when the hostname contains the subdomain
  * 'privatelink.snowflakecomputing.' but we don't have a good way of telling if a private link connection is
  * expected for internal stages for example.
  */
-func isPrivateLink(host string) bool {
+func checkIsPrivateLink(host string) bool {
 	return strings.Contains(strings.ToLower(host), ".privatelink.snowflakecomputing.")
 }
 

@@ -2,7 +2,6 @@ package gosnowflake
 
 import (
 	"crypto/rsa"
-	"errors"
 	"fmt"
 	"golang.org/x/crypto/ssh"
 	"os"
@@ -22,13 +21,12 @@ func TestKeypairInvalidKey(t *testing.T) {
 	cfg.PrivateKey = loadRsaPrivateKeyForKeyPair(t, "SNOWFLAKE_AUTH_TEST_INVALID_PRIVATE_KEY_PATH")
 	err := verifyConnectionToSnowflakeAuthTests(t, cfg)
 	var snowflakeErr *SnowflakeError
-	assertTrueF(t, errors.As(err, &snowflakeErr))
+	assertErrorsAsF(t, err, &snowflakeErr)
 	assertEqualE(t, snowflakeErr.Number, 390144, fmt.Sprintf("Expected 390144, but got %v", snowflakeErr.Number))
 }
 
 func setupKeyPairTest(t *testing.T) *Config {
-	runOnlyOnDockerContainer(t, "Running only on Docker container")
-
+	skipAuthTests(t, "Skipping KeyPair tests")
 	cfg, err := getAuthTestsConfig(t, AuthTypeJwt)
 	assertEqualE(t, err, nil, fmt.Sprintf("failed to get config: %v", err))
 

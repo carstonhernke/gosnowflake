@@ -1,5 +1,3 @@
-// Copyright (c) 2020-2022 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
@@ -29,11 +27,15 @@ func (d *noopTestDriver) OpenWithConfig(_ context.Context, config Config) (drive
 func TestConnector(t *testing.T) {
 	conn := snowflakeConn{}
 	mock := noopTestDriver{conn: &conn}
-	createDSN("UTC")
-	config, err := ParseDSN(dsn)
+
+	// Use fake DSN for unit test - should not make real connections
+	fakeDSN := "testuser:testpass@testaccount.snowflakecomputing.com:443/testdb/testschema?warehouse=testwh&role=testrole"
+	config, err := ParseDSN(fakeDSN)
 	if err != nil {
 		t.Fatal("Failed to parse dsn")
 	}
+	config.Authenticator = AuthTypeSnowflake
+	config.PrivateKey = nil
 	connector := NewConnector(&mock, *config)
 	connection, err := connector.Connect(context.Background())
 	if err != nil {
@@ -84,7 +86,11 @@ func TestConnectorCancelContext(t *testing.T) {
 	logger.SetOutput(&buf)
 
 	// pass in our context which should only be used for establishing the initial connection; not persisted.
-	sfConn, err := buildSnowflakeConn(ctx, Config{Params: make(map[string]*string)})
+	sfConn, err := buildSnowflakeConn(ctx, Config{
+		Params:        make(map[string]*string),
+		Authenticator: AuthTypeSnowflake, // Force password authentication
+		PrivateKey:    nil,               // Ensure no private key
+	})
 	assertNilF(t, err)
 
 	// patch close handler

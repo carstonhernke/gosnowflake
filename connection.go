@@ -1,5 +1,3 @@
-// Copyright (c) 2017-2022 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
@@ -11,16 +9,20 @@ import (
 	"database/sql/driver"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/apache/arrow/go/v16/arrow/ipc"
+	"go.opentelemetry.io/otel/propagation"
+
+	"github.com/apache/arrow-go/v18/arrow/ipc"
 )
 
 const (
@@ -94,7 +96,8 @@ func (sc *snowflakeConn) exec(
 	*execResponse, error) {
 	var err error
 	counter := atomic.AddUint64(&sc.SequenceCounter, 1) // query sequence counter
-
+	_, _, sessionID := safeGetTokens(sc.rest)
+	ctx = context.WithValue(ctx, SFSessionIDKey, sessionID)
 	queryContext, err := buildQueryContext(sc.queryContextCache)
 	if err != nil {
 		logger.WithContext(ctx).Errorf("error while building query context: %v", err)
@@ -130,6 +133,11 @@ func (sc *snowflakeConn) exec(
 	if isFileTransfer(query) {
 		headers[httpHeaderAccept] = headerContentTypeApplicationJSON
 	}
+
+	// propagate traceID and spanID via traceparent header. this is a no-op if invalid IDs
+	propagator := propagation.TraceContext{}
+	propagator.Inject(ctx, propagation.MapCarrier(headers))
+
 	paramsMutex.Lock()
 	if serviceName, ok := sc.cfg.Params[serviceName]; ok {
 		headers[httpHeaderServiceName] = *serviceName
@@ -258,8 +266,9 @@ func (sc *snowflakeConn) BeginTx(
 		return nil, driver.ErrBadConn
 	}
 	isDesc := isDescribeOnly(ctx)
+	isInternal := isInternal(ctx)
 	if _, err := sc.exec(ctx, "BEGIN", false, /* noResult */
-		false /* isInternal */, isDesc, nil); err != nil {
+		isInternal, isDesc, nil); err != nil {
 		return nil, err
 	}
 	return &snowflakeTx{sc, ctx}, nil
@@ -271,8 +280,6 @@ func (sc *snowflakeConn) cleanup() {
 	if sc.rest != nil && sc.rest.Client != nil {
 		sc.rest.Client.CloseIdleConnections()
 	}
-	sc.rest = nil
-	sc.cfg = nil
 }
 
 func (sc *snowflakeConn) Close() (err error) {
@@ -281,6 +288,7 @@ func (sc *snowflakeConn) Close() (err error) {
 		logger.WithContext(sc.ctx).Warnf("error while sending telemetry. %v", err)
 	}
 	sc.stopHeartBeat()
+	sc.rest.HeartBeat = nil
 	defer sc.cleanup()
 
 	if sc.cfg != nil && !sc.cfg.KeepSessionAlive {
@@ -312,15 +320,17 @@ func (sc *snowflakeConn) ExecContext(
 	query string,
 	args []driver.NamedValue) (
 	driver.Result, error) {
-	logger.WithContext(ctx).Infof("Exec: %#v, %v", query, args)
 	if sc.rest == nil {
 		return nil, driver.ErrBadConn
 	}
+	_, _, sessionID := safeGetTokens(sc.rest)
+	ctx = context.WithValue(ctx, SFSessionIDKey, sessionID)
+	logger.WithContext(ctx).Infof("Exec: %#v, %v", query, args)
 	noResult := isAsyncMode(ctx)
 	isDesc := isDescribeOnly(ctx)
-	// TODO handle isInternal
+	isInternal := isInternal(ctx)
 	ctx = setResultType(ctx, execResultType)
-	data, err := sc.exec(ctx, query, noResult, false /* isInternal */, isDesc, args)
+	data, err := sc.exec(ctx, query, noResult, isInternal, isDesc, args)
 	if err != nil {
 		logger.WithContext(ctx).Infof("error: %v", err)
 		if data != nil {
@@ -399,16 +409,17 @@ func (sc *snowflakeConn) queryContextInternal(
 	query string,
 	args []driver.NamedValue) (
 	driver.Rows, error) {
-	logger.WithContext(ctx).Infof("Query: %#v, %v", query, args)
 	if sc.rest == nil {
 		return nil, driver.ErrBadConn
 	}
 
+	_, _, sessionID := safeGetTokens(sc.rest)
+	ctx = context.WithValue(setResultType(ctx, queryResultType), SFSessionIDKey, sessionID)
+	logger.WithContext(ctx).Infof("Query: %#v, %v", query, args)
 	noResult := isAsyncMode(ctx)
 	isDesc := isDescribeOnly(ctx)
-	ctx = setResultType(ctx, queryResultType)
-	// TODO: handle isInternal
-	data, err := sc.exec(ctx, query, noResult, false /* isInternal */, isDesc, args)
+	isInternal := isInternal(ctx)
+	data, err := sc.exec(ctx, query, noResult, isInternal, isDesc, args)
 	if err != nil {
 		logger.WithContext(ctx).Errorf("error: %v", err)
 		if data != nil {
@@ -435,7 +446,6 @@ func (sc *snowflakeConn) queryContextInternal(
 	rows.sc = sc
 	rows.queryID = data.Data.QueryID
 	rows.ctx = ctx
-	rows.format = resultFormat(data.Data.QueryResultFormat)
 
 	if isMultiStmt(&data.Data) {
 		// handleMultiQuery is responsible to fill rows with childResults
@@ -475,9 +485,9 @@ func (sc *snowflakeConn) Ping(ctx context.Context) error {
 	}
 	noResult := isAsyncMode(ctx)
 	isDesc := isDescribeOnly(ctx)
-	// TODO: handle isInternal
+	isInternal := isInternal(ctx)
 	ctx = setResultType(ctx, execResultType)
-	_, err := sc.exec(ctx, "SELECT 1", noResult, false, /* isInternal */
+	_, err := sc.exec(ctx, "SELECT 1", noResult, isInternal,
 		isDesc, []driver.NamedValue{})
 	return err
 }
@@ -485,7 +495,7 @@ func (sc *snowflakeConn) Ping(ctx context.Context) error {
 // CheckNamedValue determines which types are handled by this driver aside from
 // the instances captured by driver.Value
 func (sc *snowflakeConn) CheckNamedValue(nv *driver.NamedValue) error {
-	if supportedNullBind(nv) || supportedArrayBind(nv) || supportedStructuredObjectWriterBind(nv) || supportedStructuredArrayBind(nv) || supportedStructuredMapBind(nv) {
+	if supportedNullBind(nv) || supportedDecfloatBind(nv) || supportedArrayBind(nv) || supportedStructuredObjectWriterBind(nv) || supportedStructuredArrayBind(nv) || supportedStructuredMapBind(nv) {
 		return nil
 	}
 	return driver.ErrSkip
@@ -518,7 +528,8 @@ func (sc *snowflakeConn) QueryArrowStream(ctx context.Context, query string, bin
 	ctx = WithArrowBatches(context.WithValue(ctx, asyncMode, false))
 	ctx = setResultType(ctx, queryResultType)
 	isDesc := isDescribeOnly(ctx)
-	data, err := sc.exec(ctx, query, false, false /* isinternal */, isDesc, bindings)
+	isInternal := isInternal(ctx)
+	data, err := sc.exec(ctx, query, false, isInternal, isDesc, bindings)
 	if err != nil {
 		logger.WithContext(ctx).Errorf("error: %v", err)
 		if data != nil {
@@ -536,7 +547,11 @@ func (sc *snowflakeConn) QueryArrowStream(ctx context.Context, query string, bin
 		return nil, err
 	}
 
-	return &snowflakeArrowStreamChunkDownloader{
+	var resultIDs []string
+	if len(data.Data.ResultIDs) > 0 {
+		resultIDs = strings.Split(data.Data.ResultIDs, ",")
+	}
+	scd := &snowflakeArrowStreamChunkDownloader{
 		sc:          sc,
 		ChunkMetas:  data.Data.Chunks,
 		Total:       data.Data.Total,
@@ -548,7 +563,15 @@ func (sc *snowflakeConn) QueryArrowStream(ctx context.Context, query string, bin
 			JSON:         data.Data.RowSet,
 			RowSetBase64: data.Data.RowSetBase64,
 		},
-	}, nil
+		resultIDs: resultIDs,
+	}
+	// if multistatement is used, we need to set the first result set to actual result set, not the aggregated response
+	if scd.hasNextResultSet() {
+		if err = scd.NextResultSet(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return scd, nil
 }
 
 // ArrowStreamBatch is a type describing a potentially yet-to-be-downloaded
@@ -603,7 +626,11 @@ func (asb *ArrowStreamBatch) downloadChunkStreamHelper(ctx context.Context) erro
 	}
 	logger.WithContext(ctx).Debugf("response returned chunk: %v for URL: %v", asb.idx+1, asb.scd.ChunkMetas[asb.idx].URL)
 	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
+		defer func() {
+			if err = resp.Body.Close(); err != nil {
+				logger.WithContext(ctx).Errorf("error closing response body for %v: %v", asb.scd.ChunkMetas[asb.idx].URL, err)
+			}
+		}()
 		b, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return err
@@ -621,7 +648,9 @@ func (asb *ArrowStreamBatch) downloadChunkStreamHelper(ctx context.Context) erro
 
 	defer func() {
 		if asb.rr == nil {
-			resp.Body.Close()
+			if err = resp.Body.Close(); err != nil {
+				logger.WithContext(ctx).Errorf("error closing response body for %v: %v", asb.scd.ChunkMetas[asb.idx].URL, err)
+			}
 		}
 	}()
 
@@ -669,10 +698,22 @@ func (asb *ArrowStreamBatch) GetStream(ctx context.Context) (io.ReadCloser, erro
 // and no errors. In this case, the data is accessible via JSONData
 // with the actual types matching up to the metadata in RowTypes.
 type ArrowStreamLoader interface {
+	// GetBatches returns the result for the current result set, if response was Arrow.
+	// If multistatement is used, this returns the batches for the current result set.
 	GetBatches() ([]ArrowStreamBatch, error)
+	// NextResultSet returns an io.EOF if there are no more batches to download.
+	NextResultSet(ctx context.Context) error
+	// TotalRows returns the total number of rows found.
+	// If multistatement is used, this is the total number of rows in the current result set.
 	TotalRows() int64
+	// RowTypes returns the types of the rows.
+	// If multistatement is used, this is the types of the rows in the current result set.
 	RowTypes() []execResponseRowType
+	// Location returns the location associated with the query response.
+	// If multistatement is used, this is the location of the initial query.
 	Location() *time.Location
+	// JSONData returns the data if JSON was returned instead of Arrow.
+	// If multistatement is used, this is the data for the current result set.
 	JSONData() [][]*string
 }
 
@@ -684,6 +725,7 @@ type snowflakeArrowStreamChunkDownloader struct {
 	ChunkHeader map[string]string
 	FuncGet     func(context.Context, *snowflakeConn, string, map[string]string, time.Duration) (*http.Response, error)
 	RowSet      rowSetType
+	resultIDs   []string
 }
 
 func (scd *snowflakeArrowStreamChunkDownloader) Location() *time.Location {
@@ -772,6 +814,48 @@ func (scd *snowflakeArrowStreamChunkDownloader) GetBatches() (out []ArrowStreamB
 	return
 }
 
+func (scd *snowflakeArrowStreamChunkDownloader) NextResultSet(ctx context.Context) error {
+	if !scd.hasNextResultSet() {
+		logger.Debug("no more result sets to download")
+		return io.EOF
+	}
+	resultID := scd.resultIDs[0]
+	logger.Debugf("downloading next result set, resultID: %v", resultID)
+	scd.resultIDs = scd.resultIDs[1:]
+	resultPath := fmt.Sprintf(urlQueriesResultFmt, resultID)
+	resp, err := scd.sc.getQueryResultResp(ctx, resultPath)
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		logger.WithContext(ctx).Warnf("error while getting next result set, error code: %v, message: %v", resp.Code, resp.Message)
+		code, err := strconv.Atoi(resp.Code)
+		if err != nil {
+			logger.WithContext(ctx).Errorf("error while parsing code: %v", err)
+		}
+		return (&SnowflakeError{
+			Number:   code,
+			SQLState: resp.Data.SQLState,
+			Message:  resp.Message,
+			QueryID:  resp.Data.QueryID,
+		}).exceptionTelemetry(scd.sc)
+	}
+	scd.ChunkMetas = resp.Data.Chunks
+	scd.Total = resp.Data.Total
+	scd.Qrmk = resp.Data.Qrmk
+	scd.ChunkHeader = resp.Data.ChunkHeaders
+	scd.RowSet = rowSetType{
+		RowType:      resp.Data.RowType,
+		JSON:         resp.Data.RowSet,
+		RowSetBase64: resp.Data.RowSetBase64,
+	}
+	return nil
+}
+
+func (scd *snowflakeArrowStreamChunkDownloader) hasNextResultSet() bool {
+	return len(scd.resultIDs) > 0
+}
+
 // buildSnowflakeConn creates a new snowflakeConn.
 // The provided context is used only for establishing the initial connection.
 func buildSnowflakeConn(ctx context.Context, config Config) (*snowflakeConn, error) {
@@ -786,24 +870,23 @@ func buildSnowflakeConn(ctx context.Context, config Config) (*snowflakeConn, err
 	if err != nil {
 		return nil, err
 	}
-	var st http.RoundTripper = SnowflakeTransport
-	if sc.cfg.Transporter == nil {
-		if sc.cfg.DisableOCSPChecks || sc.cfg.InsecureMode {
-			// no revocation check with OCSP. Think twice when you want to enable this option.
-			st = snowflakeNoOcspTransport
-		} else {
-			// set OCSP fail open mode
-			ocspResponseCacheLock.Lock()
-			atomic.StoreUint32((*uint32)(&ocspFailOpen), uint32(sc.cfg.OCSPFailOpen))
-			ocspResponseCacheLock.Unlock()
-		}
+
+	telemetry := &snowflakeTelemetry{}
+	if config.DisableTelemetry {
+		telemetry.enabled = false
 	} else {
-		// use the custom transport
-		st = sc.cfg.Transporter
+		telemetry.flushSize = defaultFlushSize
+		telemetry.sr = sc.rest
+		telemetry.mutex = &sync.Mutex{}
+		telemetry.enabled = true
 	}
-	if err = setupOCSPEnvVars(ctx, sc.cfg.Host); err != nil {
+
+	transportFactory := newTransportFactory(&config, telemetry)
+	st, err := transportFactory.createTransport()
+	if err != nil {
 		return nil, err
 	}
+
 	var tokenAccessor TokenAccessor
 	if sc.cfg.TokenAccessor != nil {
 		tokenAccessor = sc.cfg.TokenAccessor
@@ -843,34 +926,8 @@ func buildSnowflakeConn(ctx context.Context, config Config) (*snowflakeConn, err
 		FuncGetSSO:          getSSO,
 	}
 
-	if sc.cfg.DisableTelemetry {
-		sc.telemetry = &snowflakeTelemetry{enabled: false}
-	} else {
-		sc.telemetry = &snowflakeTelemetry{
-			flushSize: defaultFlushSize,
-			sr:        sc.rest,
-			mutex:     &sync.Mutex{},
-			enabled:   true,
-		}
-	}
+	telemetry.sr = sc.rest
+	sc.telemetry = telemetry
 
 	return sc, nil
-}
-
-func getTransport(cfg *Config) http.RoundTripper {
-	if cfg == nil {
-		logger.Debug("getTransport: got nil Config, will perform OCSP validation for cloud storage")
-		return SnowflakeTransport
-	}
-	// if user configured a custom Transporter, prioritize that
-	if cfg.Transporter != nil {
-		logger.Debug("getTransport: using Transporter configured by the user")
-		return cfg.Transporter
-	}
-	if cfg.DisableOCSPChecks || cfg.InsecureMode {
-		logger.Debug("getTransport: skipping OCSP validation for cloud storage")
-		return snowflakeNoOcspTransport
-	}
-	logger.Debug("getTransport: will perform OCSP validation for cloud storage")
-	return SnowflakeTransport
 }

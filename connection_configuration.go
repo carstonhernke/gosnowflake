@@ -1,5 +1,3 @@
-// Copyright (c) 2024 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
@@ -18,6 +16,12 @@ const (
 	snowflakeConnectionName = "SNOWFLAKE_DEFAULT_CONNECTION_NAME"
 	snowflakeHome           = "SNOWFLAKE_HOME"
 	defaultTokenPath        = "/snowflake/session/token"
+
+	othersCanReadFilePermission  = os.FileMode(0044)
+	othersCanWriteFilePermission = os.FileMode(0022)
+	executableFilePermission     = os.FileMode(0111)
+
+	skipWarningForReadPermissionsEnv = "SF_SKIP_WARNING_FOR_READ_PERMISSIONS_ON_CONFIG_FILE"
 )
 
 // LoadConnectionConfig returns connection configs loaded from the toml file.
@@ -84,7 +88,12 @@ func parseToml(cfg *Config, connectionMap map[string]interface{}) error {
 func handleSingleParam(cfg *Config, key string, value interface{}) error {
 	var err error
 	var v, tokenPath string
-	switch strings.ToLower(key) {
+
+	// We normalize the key to handle both snake_case and camelCase.
+	normalizedKey := strings.ReplaceAll(strings.ToLower(key), "_", "")
+
+	// the cases in switch statement should be in lower case and no _
+	switch normalizedKey {
 	case "user", "username":
 		cfg.User, err = parseString(value)
 	case "password":
@@ -180,7 +189,24 @@ func handleSingleParam(cfg *Config, key string, value interface{}) error {
 		cfg.DisableConsoleLogin, err = parseConfigBool(value)
 	case "disablesamlurlcheck":
 		cfg.DisableSamlURLCheck, err = parseConfigBool(value)
-	case "token_file_path":
+	case "oauthauthorizationurl":
+		cfg.OauthAuthorizationURL, err = parseString(value)
+	case "oauthclientid":
+		cfg.OauthClientID, err = parseString(value)
+	case "oauthclientsecret":
+		cfg.OauthClientSecret, err = parseString(value)
+	case "oauthtokenrequesturl":
+		cfg.OauthTokenRequestURL, err = parseString(value)
+	case "oauthredirecturi":
+		cfg.OauthRedirectURI, err = parseString(value)
+	case "oauthscope":
+		cfg.OauthScope, err = parseString(value)
+	case "workloadidentityprovider":
+		cfg.WorkloadIdentityProvider, err = parseString(value)
+	case "workloadidentityentraresource":
+		cfg.WorkloadIdentityEntraResource, err = parseString(value)
+
+	case "tokenfilepath":
 		tokenPath, err = parseString(value)
 		if err = checkParsingError(err, key, value); err != nil {
 			return err
@@ -190,6 +216,23 @@ func handleSingleParam(cfg *Config, key string, value interface{}) error {
 			return err
 		}
 		cfg.Token = v
+
+	case "connectiondiagnosticsenabled":
+		cfg.ConnectionDiagnosticsEnabled, err = parseBool(value)
+	case "connectiondiagnosticsallowlistfile":
+		cfg.ConnectionDiagnosticsAllowlistFile, err = parseString(value)
+	case "proxyhost":
+		cfg.ProxyHost, err = parseString(value)
+	case "proxyport":
+		cfg.ProxyPort, err = parseInt(value)
+	case "proxyuser":
+		cfg.ProxyUser, err = parseString(value)
+	case "proxypassword":
+		cfg.ProxyPassword, err = parseString(value)
+	case "proxyprotocol":
+		cfg.ProxyProtocol, err = parseString(value)
+	case "noproxy":
+		cfg.NoProxy, err = parseString(value)
 	default:
 		param, err := parseString(value)
 		if err = checkParsingError(err, key, value); err != nil {
@@ -316,20 +359,43 @@ func validateFilePermission(filePath string) error {
 	if isWindows {
 		return nil
 	}
+
 	fileInfo, err := os.Stat(filePath)
 	if err != nil {
 		return err
 	}
-	if permission := fileInfo.Mode().Perm(); permission != os.FileMode(0600) {
+
+	permission := fileInfo.Mode().Perm()
+
+	if !shouldSkipWarningForReadPermissions() && permission&othersCanReadFilePermission != 0 {
+		logger.Warnf("file '%v' is readable by someone other than the owner. Your Permission: %v. If you want "+
+			"to disable this warning, either remove read permissions from group and others or set the environment "+
+			"variable %v to true", filePath, permission, skipWarningForReadPermissionsEnv)
+	}
+
+	if permission&executableFilePermission != 0 {
 		return &SnowflakeError{
 			Number:      ErrCodeInvalidFilePermission,
-			Message:     errMsgInvalidPermissionToTomlFile,
-			MessageArgs: []interface{}{permission},
+			Message:     errMsgInvalidExecutablePermissionToFile,
+			MessageArgs: []interface{}{filePath, permission},
 		}
 	}
+
+	if permission&othersCanWriteFilePermission != 0 {
+		return &SnowflakeError{
+			Number:      ErrCodeInvalidFilePermission,
+			Message:     errMsgInvalidWritablePermissionToFile,
+			MessageArgs: []interface{}{filePath, permission},
+		}
+	}
+
 	return nil
 }
 
 func shouldReadTokenFromFile(cfg *Config) bool {
 	return cfg != nil && cfg.Authenticator == AuthTypeOAuth && len(cfg.Token) == 0
+}
+
+func shouldSkipWarningForReadPermissions() bool {
+	return os.Getenv(skipWarningForReadPermissionsEnv) != ""
 }

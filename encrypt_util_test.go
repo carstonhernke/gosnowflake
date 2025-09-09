@@ -1,11 +1,10 @@
-// Copyright (c) 2021-2022 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
 	"bufio"
 	"compress/gzip"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -15,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -29,7 +29,7 @@ func TestEncryptDecryptFileCBC(t *testing.T) {
 	encMat := snowflakeFileEncryption{
 		"ztke8tIdVt1zmlQIZm0BMA==",
 		"123873c7-3a66-40c4-ab89-e3722fbccce1",
-		3112,
+		9223372036854775807,
 	}
 	data := "test data"
 	inputFile := "test_encrypt_decrypt_file"
@@ -49,6 +49,7 @@ func TestEncryptDecryptFileCBC(t *testing.T) {
 		t.Error(err)
 	}
 	defer os.Remove(encryptedFile)
+	assertStringContainsE(t, metadata.matdesc, "9223372036854775807")
 	decryptedFile, err := decryptFileCBC(metadata, &encMat, encryptedFile, 0, "")
 	if err != nil {
 		t.Error(err)
@@ -117,6 +118,47 @@ func TestEncryptDecryptLargeFileCBC(t *testing.T) {
 	}
 
 	encryptDecryptFile(t, encMat, numberOfLines, tmpDir)
+}
+
+func TestEncryptStreamCBCReadError(t *testing.T) {
+	sfe := snowflakeFileEncryption{
+		QueryStageMasterKey: "YWJjZGVmMTIzNDU2Nzg5MA==",
+		QueryID:             "unused",
+		SMKID:               9223372036854775807,
+	}
+
+	wantErr := errors.New("test error")
+	r := iotest.ErrReader(wantErr)
+
+	n, err := encryptStreamCBC(&sfe, r, nil, 0)
+	assertTrueF(t, errors.Is(err, wantErr), fmt.Sprintf("expected error: %v, got: %v", wantErr, err))
+	assertNilE(t, n, "expected no metadata on error")
+}
+
+func TestDecryptStreamCBCReadError(t *testing.T) {
+	tmpDir := t.TempDir()
+	tempFile, err := os.CreateTemp(tmpDir, "gcm")
+	assertNilF(t, err)
+	_, err = tempFile.Write([]byte("abc"))
+	assertNilF(t, err)
+	err = tempFile.Close()
+	assertNilF(t, err)
+
+	sfe := snowflakeFileEncryption{
+		QueryStageMasterKey: "YWJjZGVmMTIzNDU2Nzg5MA==",
+		QueryID:             "unused",
+		SMKID:               9223372036854775807,
+	}
+	meta, _, err := encryptFileCBC(&sfe, tempFile.Name(), 0, tmpDir)
+	assertNilF(t, err)
+	assertStringContainsF(t, meta.matdesc, "9223372036854775807")
+
+	wantErr := errors.New("test error")
+	r := iotest.ErrReader(wantErr)
+
+	n, err := decryptStreamCBC(meta, &sfe, 0, r, nil)
+	assertTrueF(t, errors.Is(err, wantErr), fmt.Sprintf("expected error: %v, got: %v", wantErr, err))
+	assertEqualE(t, n, 0, "expected 0 bytes written")
 }
 
 func encryptDecryptFile(t *testing.T, encMat snowflakeFileEncryption, expected int, tmpDir string) {
@@ -275,10 +317,11 @@ func TestEncryptDecryptFileGCM(t *testing.T) {
 	sfe := &snowflakeFileEncryption{
 		QueryStageMasterKey: "YWJjZGVmMTIzNDU2Nzg5MA==",
 		QueryID:             "unused",
-		SMKID:               123,
+		SMKID:               9223372036854775807,
 	}
 	meta, encryptedFileName, err := encryptFileGCM(sfe, tempFile.Name(), tmpDir)
 	assertNilF(t, err)
+	assertStringContainsE(t, meta.matdesc, "9223372036854775807")
 
 	decryptedFileName, err := decryptFileGCM(meta, sfe, encryptedFileName, tmpDir)
 	assertNilF(t, err)

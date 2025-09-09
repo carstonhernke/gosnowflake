@@ -1,5 +1,3 @@
-// Copyright (c) 2021-2022 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
@@ -75,21 +73,22 @@ func (util *snowflakeFileUtil) compressFileWithGzip(fileName string, tmpDir stri
 	return gzipFileName, stat.Size(), err
 }
 
-func (util *snowflakeFileUtil) getDigestAndSizeForStream(stream **bytes.Buffer) (string, int64, error) {
+func (util *snowflakeFileUtil) getDigestAndSizeForStream(stream io.Reader) (string, int64, error) {
 	m := sha256.New()
-	r := getReaderFromBuffer(stream)
 	chunk := make([]byte, fileChunkSize)
+	var total int64
 
 	for {
-		n, err := r.Read(chunk)
+		n, err := stream.Read(chunk)
 		if err == io.EOF {
 			break
 		} else if err != nil {
 			return "", 0, err
 		}
+		total += int64(n)
 		m.Write(chunk[:n])
 	}
-	return base64.StdEncoding.EncodeToString(m.Sum(nil)), int64((*stream).Len()), nil
+	return base64.StdEncoding.EncodeToString(m.Sum(nil)), total, nil
 }
 
 func (util *snowflakeFileUtil) getDigestAndSizeForFile(fileName string) (digest string, size int64, err error) {
@@ -131,6 +130,7 @@ type fileMetadata struct {
 	resStatus          resultStatus
 	stageInfo          *execResponseStageInfo
 	encryptionMaterial *snowflakeFileEncryption
+	encryptMeta        *encryptMetadata
 
 	srcFileName        string
 	realSrcFileName    string
@@ -155,6 +155,7 @@ type fileMetadata struct {
 	options            *SnowflakeFileTransferOptions
 
 	/* streaming PUT */
+	fileStream    io.Reader
 	srcStream     *bytes.Buffer
 	realSrcStream *bytes.Buffer
 

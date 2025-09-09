@@ -7,7 +7,7 @@
         "method": "POST",
         "headers": {
           "Authorization": {
-            "equalTo": "%AUTHORIZATION_HEADER%"
+            "equalTo": "Snowflake Token=\"session token\""
           }
         }
       },
@@ -176,7 +176,6 @@
             "finalDatabaseName": null,
             "finalSchemaName": null,
             "finalWarehouseName": "TEST_XSMALL",
-            "finalRoleName": "ACCOUNTADMIN",
             "numberOfBinds": 0,
             "arrayBindSupported": false,
             "statementTypeId": 4096,

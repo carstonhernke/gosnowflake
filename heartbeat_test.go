@@ -1,5 +1,3 @@
-// Copyright (c) 2023 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
@@ -44,14 +42,10 @@ func TestUnitPostHeartbeat(t *testing.T) {
 func TestHeartbeatStartAndStop(t *testing.T) {
 	createDSNWithClientSessionKeepAlive()
 	config, err := ParseDSN(dsn)
-	if err != nil {
-		t.Fatalf("failed to parse dsn. err: %v", err)
-	}
+	assertNilF(t, err, "failed to parse dsn")
 	driver := SnowflakeDriver{}
 	db, err := driver.OpenWithConfig(context.Background(), *config)
-	if err != nil {
-		t.Fatalf("failed to open with config. config: %v, err: %v", config, err)
-	}
+	assertNilF(t, err, "failed to open with config")
 
 	conn, ok := db.(*snowflakeConn)
 	assertTrueF(t, ok, "connection should be snowflakeConn")
@@ -60,5 +54,5 @@ func TestHeartbeatStartAndStop(t *testing.T) {
 
 	err = db.Close()
 	assertNilF(t, err, "should not cause error in Close")
-	assertNilF(t, conn.rest, "heartbeat should be nil")
+	assertNilF(t, conn.rest.HeartBeat, "heartbeat should be nil")
 }

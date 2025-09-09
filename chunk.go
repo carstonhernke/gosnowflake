@@ -1,5 +1,3 @@
-// Copyright (c) 2018-2022 Snowflake Computing Inc. All rights reserved.
-
 package gosnowflake
 
 import (
@@ -75,10 +73,10 @@ OuterLoop:
 		}
 		rows = append(rows, row)
 
-		switch c := lcd.nextByteNonWhitespace(); {
-		case c == ',':
+		switch lcd.nextByteNonWhitespace() {
+		case ',':
 			continue // more elements in the array
-		case c == ']':
+		case ']':
 			return rows, nil // we've scanned the whole chunk
 		default:
 			break OuterLoop
@@ -106,10 +104,10 @@ OuterLoop:
 		}
 		row = append(row, cell)
 
-		switch c := lcd.nextByteNonWhitespace(); {
-		case c == ',':
+		switch lcd.nextByteNonWhitespace() {
+		case ',':
 			continue // more elements in the array
-		case c == ']':
+		case ']':
 			return row, nil // we've scanned the whole row
 		default:
 			break OuterLoop
@@ -120,10 +118,11 @@ OuterLoop:
 
 func (lcd *largeChunkDecoder) decodeCell() (*string, error) {
 	c := lcd.nextByteNonWhitespace()
-	if c == '"' {
+	switch c {
+	case '"':
 		s, err := lcd.decodeString()
 		return &s, err
-	} else if c == 'n' {
+	case 'n':
 		if lcd.nextByte() == 'u' &&
 			lcd.nextByte() == 'l' &&
 			lcd.nextByte() == 'l' {
